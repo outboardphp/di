@@ -54,9 +54,8 @@ class Container implements ComposableContainer
             return $this->cache->getFactory($id)();
         }
 
-        // First-time resolution
-        $resolution = $this->resolve($id);
-        $instance = ($resolution->factory)();
+        // First-time resolution with fallback support
+        [$resolution, $instance] = $this->resolve($id);
         $this->cacheResolution($id, $resolution, $instance);
         return $instance;
     }
@@ -64,25 +63,36 @@ class Container implements ComposableContainer
     /**
      * Always gets a fresh instance of a service, but uses the cached factory if possible.
      *
-     * @param string $id
-     * @return mixed
      * @throws ContainerExceptionInterface
      * @throws \ReflectionException
      */
-    public function make(string $id)
+    public function make(string $id): mixed
     {
         if ($this->cache->hasFactory($id)) {
             return $this->cache->getFactory($id)();
         }
 
-        // First-time resolution, but don't cache anything
-        $resolution = $this->resolve($id);
-        return ($resolution->factory)();
+        // First-time resolution with fallback support
+        [, $instance] = $this->resolve($id);
+        return $instance;
     }
 
     public function has(string $id): bool
     {
         return \array_any($this->resolvers, fn($resolver) => $resolver->has($id));
+    }
+
+    /**
+     * @return mixed[]
+     */
+    public function getTagged(string $tag): array
+    {
+        return array_map([$this, 'get'], $this->checkTag($tag));
+    }
+
+    public function hasTag(string $tag): bool
+    {
+        return \count($this->checkTag($tag, true)) > 0;
     }
 
     /**
@@ -152,21 +162,46 @@ class Container implements ComposableContainer
     }
 
     /**
+     * Try each resolver in order, invoking the factory to confirm it works.
+     * If a resolver's factory fails (e.g., missing parameters in explicit resolution),
+     * fall through to the next resolver (e.g., autowiring).
+     * Returns both the ResolvedFactory and the already-created instance to avoid a redundant call.
+     *
+     * @return array{ResolvedFactory, mixed}
      * @throws ContainerExceptionInterface|\ReflectionException
      */
-    protected function resolve(string $id): ResolvedFactory
+    protected function resolve(string $id): array
     {
-        // Find a resolver that can resolve this id
-        $resolver = \array_find($this->resolvers, fn($resolver) => $resolver->has($id));
-        if ($resolver === null) {
-            throw new NotFoundException("No entry was found for '$id'.");
+        $lastException = null;
+
+        foreach ($this->resolvers as $resolver) {
+            if (!$resolver->has($id)) {
+                continue;
+            }
+
+            try {
+                $resolution = $resolver->resolve($id, $this->parent ?? $this);
+                if (!$resolution->factory) {
+                    throw new ContainerException('Should not happen');
+                }
+
+                // Invoke the factory once; if it fails (e.g., missing parameters in explicit
+                // resolution), catch and try the next resolver (e.g., autowiring).
+                $instance = ($resolution->factory)();
+                return [$resolution, $instance];
+            } catch (ContainerExceptionInterface $e) {
+                // Resolution or factory invocation failed, try next resolver
+                $lastException = $e;
+                continue;
+            }
         }
 
-        $resolution = $resolver->resolve($id, $this->parent ?? $this);
-        if (!$resolution->factory) {
-            throw new ContainerException('Should not happen');
+        // If we got here, no resolver could handle it
+        if ($lastException !== null) {
+            throw $lastException;
         }
-        return $resolution;
+
+        throw new NotFoundException("No entry was found for '$id'.");
     }
 
     protected function cacheResolution(string $id, ResolvedFactory $resolution, mixed $instance): void
@@ -176,5 +211,26 @@ class Container implements ComposableContainer
         }
         $factory = $resolution->factory;
         $this->cache->setFactory($id, $factory);
+    }
+
+    /**
+     * @param string $tag
+     * @param bool $exitEarly
+     * @return string[]
+     */
+    protected function checkTag($tag, $exitEarly = false): array
+    {
+        $ids = [];
+        foreach ($this->resolvers as $resolver) {
+            foreach ($resolver->getDefinitions() as $id => $definition) {
+                if (\in_array($tag, $definition->tags, true)) {
+                    $ids[] = $id;
+                    if ($exitEarly) {
+                        break 2;
+                    }
+                }
+            }
+        }
+        return $ids;
     }
 }
